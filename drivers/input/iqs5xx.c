@@ -233,6 +233,17 @@ static void iqs5xx_rdy_handler(const struct device *port, struct gpio_callback *
     k_work_submit(&data->work);
 }
 
+// Polling fallback for boards that do not wire the trackpad's RDY line
+// (e.g. the Ergo Haven K:04 touchpad module socket): periodically run the
+// same report-reading work that the RDY interrupt would have triggered.
+static void iqs5xx_poll_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs5xx_data *data = CONTAINER_OF(dwork, struct iqs5xx_data, poll_work);
+
+    k_work_submit(&data->work);
+    k_work_reschedule(&data->poll_work, K_MSEC(CONFIG_INPUT_AZOTEQ_IQS5XX_POLL_INTERVAL_MS));
+}
+
 static int iqs5xx_setup_device(const struct device *dev) {
     const struct iqs5xx_config *config = dev->config;
     int ret;
@@ -359,29 +370,34 @@ static int iqs5xx_init(const struct device *dev) {
         k_msleep(10);
     }
 
-    // Configure RDY GPIO.
-    if (!gpio_is_ready_dt(&config->rdy_gpio)) {
-        LOG_ERR("RDY GPIO not ready");
-        return -ENODEV;
-    }
+    // Configure the RDY GPIO interrupt when the board wires the trackpad's
+    // RDY line; otherwise fall back to polling the device over I2C.
+    if (config->rdy_gpio.port) {
+        if (!gpio_is_ready_dt(&config->rdy_gpio)) {
+            LOG_ERR("RDY GPIO not ready");
+            return -ENODEV;
+        }
 
-    ret = gpio_pin_configure_dt(&config->rdy_gpio, GPIO_INPUT);
-    if (ret < 0) {
-        LOG_ERR("Failed to configure RDY GPIO: %d", ret);
-        return ret;
-    }
+        ret = gpio_pin_configure_dt(&config->rdy_gpio, GPIO_INPUT);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure RDY GPIO: %d", ret);
+            return ret;
+        }
 
-    gpio_init_callback(&data->rdy_cb, iqs5xx_rdy_handler, BIT(config->rdy_gpio.pin));
-    ret = gpio_add_callback(config->rdy_gpio.port, &data->rdy_cb);
-    if (ret < 0) {
-        LOG_ERR("Failed to add RDY callback: %d", ret);
-        return ret;
-    }
+        gpio_init_callback(&data->rdy_cb, iqs5xx_rdy_handler, BIT(config->rdy_gpio.pin));
+        ret = gpio_add_callback(config->rdy_gpio.port, &data->rdy_cb);
+        if (ret < 0) {
+            LOG_ERR("Failed to add RDY callback: %d", ret);
+            return ret;
+        }
 
-    ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_RISING);
-    if (ret < 0) {
-        LOG_ERR("Failed to configure RDY interrupt: %d", ret);
-        return ret;
+        ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_RISING);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure RDY interrupt: %d", ret);
+            return ret;
+        }
+    } else {
+        k_work_init_delayable(&data->poll_work, iqs5xx_poll_work_handler);
     }
 
     // Wait for device to be ready.
@@ -397,6 +413,12 @@ static int iqs5xx_init(const struct device *dev) {
     data->initialized = true;
     LOG_INF("IQS5xx trackpad initialized");
 
+    // No RDY line wired: start the polling loop instead.
+    if (config->rdy_gpio.port == NULL) {
+        LOG_INF("RDY GPIO not present, starting polling mode");
+        k_work_schedule(&data->poll_work, K_MSEC(CONFIG_INPUT_AZOTEQ_IQS5XX_POLL_INTERVAL_MS));
+    }
+
     return 0;
 }
 
@@ -405,7 +427,7 @@ static int iqs5xx_init(const struct device *dev) {
     static struct iqs5xx_data iqs5xx_data_##n;                                                     \
     static const struct iqs5xx_config iqs5xx_config_##n = {                                        \
         .i2c = I2C_DT_SPEC_INST_GET(n),                                                            \
-        .rdy_gpio = GPIO_DT_SPEC_INST_GET(n, rdy_gpios),                                           \
+        .rdy_gpio = GPIO_DT_SPEC_INST_GET_OR(n, rdy_gpios, {0}),                                           \
         .reset_gpio = GPIO_DT_SPEC_INST_GET_OR(n, reset_gpios, {0}),                               \
         .one_finger_tap = DT_INST_PROP(n, one_finger_tap),                                         \
         .press_and_hold = DT_INST_PROP(n, press_and_hold),                                         \

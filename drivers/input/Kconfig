@@ -17,4 +17,14 @@ config INPUT_AZOTEQ_IQS5XX_INIT_PRIORITY
       Driver initialization priority for the IQS5xx driver.
       Lower values initialize earlier.
 
+config INPUT_AZOTEQ_IQS5XX_POLL_INTERVAL_MS
+    int "I2C polling interval in milliseconds"
+    default 16
+    help
+      Polling interval used when no RDY GPIO is configured in the
+      devicetree. The Ergo Haven K:04 touchpad module socket does not
+      route the trackpad's RDY line to the MCU, so the chip must be
+      polled. 16ms gives ~60 reports/s; lower for smoother motion at
+      the cost of some battery drain on the peripheral half.
+
 endif # INPUT_AZOTEQ_IQS5XX
