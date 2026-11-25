@@ -14,9 +14,18 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#if IS_ENABLED(CONFIG_ZMK_SLEEP)
+#include <zmk/activity.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/activity_state_changed.h>
+#endif
+
 #include "iqs5xx.h"
 
 LOG_MODULE_REGISTER(iqs5xx, CONFIG_INPUT_LOG_LEVEL);
+
+/* Needed by the work handler below; defined further down. */
+static int iqs5xx_setup_device(const struct device *dev);
 
 static int iqs5xx_read_reg16(const struct device *dev, uint16_t reg, uint16_t *val) {
     const struct iqs5xx_config *config = dev->config;
@@ -85,12 +94,34 @@ static void iqs5xx_work_handler(struct k_work *work) {
     uint8_t sys_info_0, sys_info_1, gesture_events_0, gesture_events_1, num_fingers;
     int ret;
 
+    if (data->needs_reinit) {
+        /* We were parked long enough for the chip's watchdog to reset
+         * it (self-reset returns the registers to factory defaults):
+         * replay the whole configuration, in this same serialized
+         * work-queue context as the normal reads. */
+        ret = iqs5xx_setup_device(dev);
+        if (ret < 0) {
+            data->read_failing = true; /* keep backing off, retry next tick */
+            if (data->fail_count < UINT8_MAX) {
+                data->fail_count++;
+            }
+            return;
+        }
+        data->needs_reinit = false;
+    }
+
     // Read system info registers.
     ret = iqs5xx_read_reg8(dev, IQS5XX_SYSTEM_INFO_0, &sys_info_0);
     if (ret < 0) {
         LOG_ERR("Failed to read system info 0: %d", ret);
+        data->read_failing = true;
+        if (data->fail_count < UINT8_MAX) {
+            data->fail_count++;
+        }
         goto end_comm;
     }
+    data->read_failing = false;
+    data->fail_count = 0;
 
     ret = iqs5xx_read_reg8(dev, IQS5XX_SYSTEM_INFO_1, &sys_info_1);
     if (ret < 0) {
@@ -115,6 +146,16 @@ static void iqs5xx_work_handler(struct k_work *work) {
         LOG_INF("Device reset detected");
         // Acknowledge reset.
         iqs5xx_write_reg8(dev, IQS5XX_SYSTEM_CONTROL_0, IQS5XX_ACK_RESET);
+        /* The chip is back at factory defaults: no event mode, no
+         * gestures, no axis config — it stays deaf forever unless we
+         * replay the setup (this is the "touchpad worked for 10 minutes
+         * then died" bug after any watchdog/EMI reset). setup_device()
+         * ends the communication window itself. */
+        if (iqs5xx_setup_device(dev) == 0) {
+            data->needs_reinit = false;
+            return;
+        }
+        data->needs_reinit = true; /* chip answered but writes failed: retry next cycle */
         goto end_comm;
     }
 
@@ -240,9 +281,73 @@ static void iqs5xx_poll_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct iqs5xx_data *data = CONTAINER_OF(dwork, struct iqs5xx_data, poll_work);
 
+    if (data->paused) {
+        /* The ZMK activity listener below re-schedules us on wake. */
+        return;
+    }
+
     k_work_submit(&data->work);
-    k_work_reschedule(&data->poll_work, K_MSEC(CONFIG_INPUT_AZOTEQ_IQS5XX_POLL_INTERVAL_MS));
+    /* Back the loop off to a slow cadence only once the chip has
+     * ignored a burst of polls (empty module socket, dead bus), but
+     * keep polling fast for the first few failures: right after ZMK
+     * wake the touchpad either needs a power-up or a re-init, and a
+     * 1 s backoff there is the "first touch takes ages" symptom. */
+    k_work_reschedule(&data->poll_work,
+                      K_MSEC(data->read_failing && data->fail_count > 5
+                                 ? CONFIG_INPUT_AZOTEQ_IQS5XX_POLL_BACKOFF_MS
+                                 : CONFIG_INPUT_AZOTEQ_IQS5XX_POLL_INTERVAL_MS));
 }
+
+/* -------------------------------------------------------------------------
+ * ZMK power-gating of the polling loop (polling mode only).
+ *
+ * The fast poll is the design cost of a touchpad the user is actively
+ * using — but ZMK parks the whole SoC when the half sleeps, and a
+ * 16 ms k_work loop drags it out of deep idle 60+ times a second,
+ * forever. Park the loop on SLEEP, resume on wake, and re-apply the
+ * chip configuration after a long park because the IQS5xx watchdog
+ * will have reset the chip meanwhile. (ZMK v0.3 activity states are
+ * only ACTIVE/IDLE/SLEEP — we deliberately do NOT park on IDLE: the
+ * half is still awake there and the touchpad must stay live.)
+ * ------------------------------------------------------------------------- */
+#if IS_ENABLED(CONFIG_ZMK_SLEEP)
+
+static const struct device *pm_poll_dev;
+
+static int iqs5xx_pm_listener_cb(const zmk_event_t *eh) {
+    struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+    if (ev == NULL || pm_poll_dev == NULL) {
+        return 0;
+    }
+
+    struct iqs5xx_data *data = pm_poll_dev->data;
+
+    if (ev->state == ZMK_ACTIVITY_SLEEP) {
+        if (!data->paused) {
+            data->paused = true;
+            data->paused_at = k_uptime_get();
+            k_work_cancel_delayable(&data->poll_work);
+        }
+        return 0;
+    }
+
+    if (data->paused) {
+        data->paused = false;
+        /* The chip watchdog has likely fired during the park: the next
+         * work cycle replays iqs5xx_setup_device() before reading. */
+        data->needs_reinit = (k_uptime_get() - data->paused_at) > 5000;
+        /* Retry at full speed first — the backoff is for a dead bus,
+         * not for a chip that is merely waking up. */
+        data->fail_count = 0;
+        k_work_schedule(&data->poll_work, K_NO_WAIT);
+    }
+    return 0;
+}
+
+ZMK_LISTENER(iqs5xx_pm, iqs5xx_pm_listener_cb);
+ZMK_SUBSCRIPTION(iqs5xx_pm, zmk_activity_state_changed);
+
+#endif /* IS_ENABLED(CONFIG_ZMK_SLEEP) */
 
 static int iqs5xx_setup_device(const struct device *dev) {
     const struct iqs5xx_config *config = dev->config;
@@ -417,6 +522,11 @@ static int iqs5xx_init(const struct device *dev) {
     if (config->rdy_gpio.port == NULL) {
         LOG_INF("RDY GPIO not present, starting polling mode");
         k_work_schedule(&data->poll_work, K_MSEC(CONFIG_INPUT_AZOTEQ_IQS5XX_POLL_INTERVAL_MS));
+#if IS_ENABLED(CONFIG_ZMK_SLEEP)
+        /* Single polling-mode instance per keyboard (the K:04 module
+         * socket); the PM listener below parks exactly this device. */
+        pm_poll_dev = dev;
+#endif
     }
 
     return 0;

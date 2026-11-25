@@ -148,6 +148,21 @@ struct iqs5xx_data {
     // Flag to indicate if the button was pressed in a previous cycle.
     uint8_t buttons_pressed;
     bool active_hold;
+    // True while the first register read of a cycle keeps failing (e.g.
+    // no module in the socket: every access NACKs). Used to back the
+    // polling loop off to the slow interval instead of hammering the bus.
+    bool read_failing;
+    // Consecutive failed cycles. The poll stays at the fast interval for
+    // the first few retries (a chip that just woke up NACKs for a few
+    // milliseconds while its own power-up completes) and only then backs
+    // off to the slow interval.
+    uint8_t fail_count;
+    // Polling loop is parked because ZMK reports the half as asleep.
+    bool paused;
+    int64_t paused_at;
+    // Re-run iqs5xx_setup_device() on the next work cycle: the chip's
+    // watchdog reset it while polling was parked.
+    bool needs_reinit;
     // Scroll accumulators.
     int16_t scroll_x_acc;
     int16_t scroll_y_acc;

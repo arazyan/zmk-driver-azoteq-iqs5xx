@@ -27,4 +27,13 @@ config INPUT_AZOTEQ_IQS5XX_POLL_INTERVAL_MS
       polled. 16ms gives ~60 reports/s; lower for smoother motion at
       the cost of some battery drain on the peripheral half.
 
+config INPUT_AZOTEQ_IQS5XX_POLL_BACKOFF_MS
+    int "I2C polling interval in milliseconds while the chip is unresponsive"
+    default 1000
+    help
+      When a full read cycle fails (no module in the socket, dead bus)
+      the poll loop slows to this interval instead of hammering the bus
+      at full speed. The loop returns to POLL_INTERVAL_MS as soon as a
+      read succeeds again.
+
 endif # INPUT_AZOTEQ_IQS5XX
